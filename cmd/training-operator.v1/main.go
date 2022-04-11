@@ -39,6 +39,7 @@ import (
 	"github.com/kubeflow/training-operator/pkg/config"
 	controllerv1 "github.com/kubeflow/training-operator/pkg/controller.v1"
 	//+kubebuilder:scaffold:imports
+	volcanov1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 )
 
 var (
@@ -54,6 +55,7 @@ func init() {
 	utilruntime.Must(mxnetv1.AddToScheme(scheme))
 	utilruntime.Must(mpiv1.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
+	utilruntime.Must(volcanov1beta1.AddToScheme(scheme))
 }
 
 func main() {

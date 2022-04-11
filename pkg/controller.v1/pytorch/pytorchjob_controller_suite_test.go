@@ -21,17 +21,18 @@ import (
 
 	v1 "github.com/kubeflow/training-operator/pkg/apis/pytorch/v1"
 	"github.com/kubeflow/training-operator/pkg/config"
-
 	. "github.com/onsi/ginkgo"
 	"github.com/onsi/gomega"
 	. "github.com/onsi/gomega"
-	"k8s.io/client-go/kubernetes/scheme"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	volcanov1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	//+kubebuilder:scaffold:imports
 )
 
@@ -68,7 +69,12 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(cfg).NotTo(BeNil())
 
-	err = v1.AddToScheme(scheme.Scheme)
+	s := runtime.NewScheme()
+	err = corev1.AddToScheme(s)
+	Expect(err).NotTo(HaveOccurred())
+	err = v1.AddToScheme(s)
+	Expect(err).NotTo(HaveOccurred())
+	err = volcanov1beta1.AddToScheme(s)
 	Expect(err).NotTo(HaveOccurred())
 
 	// Set default config.
@@ -76,12 +82,12 @@ var _ = BeforeSuite(func() {
 	config.Config.PyTorchInitContainerTemplateFile = config.PyTorchInitContainerTemplateFileDefault
 
 	//+kubebuilder:scaffold:scheme
-
-	testK8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
+	testK8sClient, err = client.New(cfg, client.Options{Scheme: s})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(testK8sClient).NotTo(BeNil())
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:             s,
 		MetricsBindAddress: "0",
 	})
 	Expect(err).NotTo(gomega.HaveOccurred())

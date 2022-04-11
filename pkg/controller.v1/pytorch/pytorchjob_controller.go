@@ -17,6 +17,7 @@ package pytorch
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -47,6 +48,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+	volcanov1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	volcanoclient "volcano.sh/apis/pkg/client/clientset/versioned"
 
 	pytorchv1 "github.com/kubeflow/training-operator/pkg/apis/pytorch/v1"
@@ -109,6 +111,7 @@ type PyTorchJobReconciler struct {
 //+kubebuilder:rbac:groups=kubeflow.org,resources=pytorchjobs/finalizers,verbs=update
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;delete
+//+kubebuilder:rbac:groups=scheduling.volcano.sh,resources=podgroups,verbs=get;list;watch;create;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -197,6 +200,18 @@ func (r *PyTorchJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	// inject watching for job related service
 	if err = c.Watch(&source.Kind{Type: &corev1.Service{}}, &handler.EnqueueRequestForOwner{
+		IsController: true,
+		OwnerType:    &pytorchv1.PyTorchJob{},
+	}, predicate.Funcs{
+		CreateFunc: util.OnDependentCreateFunc(r.Expectations),
+		UpdateFunc: util.OnDependentUpdateFunc(&r.JobController),
+		DeleteFunc: util.OnDependentDeleteFunc(r.Expectations),
+	}); err != nil {
+		return err
+	}
+
+	// inject watching for job related podgroup
+	if err = c.Watch(&source.Kind{Type: &volcanov1beta1.PodGroup{}}, &handler.EnqueueRequestForOwner{
 		IsController: true,
 		OwnerType:    &pytorchv1.PyTorchJob{},
 	}, predicate.Funcs{
@@ -389,8 +404,15 @@ func (r *PyTorchJobReconciler) UpdateJobStatus(job interface{},
 			}
 		} else {
 			if rtype == pytorchv1.PyTorchReplicaTypeWorker {
-				// TODO(gaocegege): Support SuccessPolicy
-				if expected == 0 {
+				worker0Completed, err := r.IsWorker0Completed(pytorchjob, replicas)
+				if err != nil {
+					logger.Warnf("check if worker 0 completed error %v", err)
+					return err
+				}
+				// Leave a succeeded condition for the following two cases:
+				// 1. If default success policy is used and worker 0 has completed.
+				// 2. If `SuccessPolicyAllWorkers` success policy is used and all workers are succeeded.
+				if expected == 0 || (worker0Completed && *pytorchjob.Spec.ElasticPolicy.SuccessPolicy != pytorchv1.SuccessPolicyAllWorkers) {
 					msg := fmt.Sprintf("TFJob %s/%s successfully completed.",
 						pytorchjob.Namespace, pytorchjob.Name)
 					r.recorder.Event(pytorchjob, corev1.EventTypeNormal, commonutil.JobSucceededReason, msg)
@@ -428,7 +450,7 @@ func (r *PyTorchJobReconciler) UpdateJobStatus(job interface{},
 					return err
 				}
 				trainingoperatorcommon.RestartedJobsCounterInc(pytorchjob.Namespace, pytorchv1.FrameworkName)
-			} else {
+			} else if running < *pytorchjob.Spec.ElasticPolicy.MinReplicas || *pytorchjob.Spec.ElasticPolicy.FailurePolicy == pytorchv1.FailurePolicyDefault {
 				msg := fmt.Sprintf("PyTorchJob %s is failed because %d %s replica(s) failed.", pytorchjob.Name, failed, rtype)
 				r.Recorder.Event(pytorchjob, corev1.EventTypeNormal, commonutil.JobFailedReason, msg)
 				if pytorchjob.Status.CompletionTime == nil {
@@ -442,10 +464,56 @@ func (r *PyTorchJobReconciler) UpdateJobStatus(job interface{},
 				}
 				trainingoperatorcommon.FailedJobsCounterInc(pytorchjob.Namespace, pytorchv1.FrameworkName)
 			}
+			// if running pods is greater or equal than MinReplicas, the job is running
 		}
 	}
 
 	return nil
+}
+
+// IsWorker0Completed returns true if pod of worker0 succeeded and qexited with 0
+func (p *PyTorchJobReconciler) IsWorker0Completed(job *pytorchv1.PyTorchJob,
+	replicas map[commonv1.ReplicaType]*commonv1.ReplicaSpec) (bool, error) {
+	worker0Completed := false
+	_, ok := replicas[pytorchv1.PyTorchReplicaTypeWorker]
+	if !ok {
+		return true, nil
+	}
+	podSlices, err := p.getPodSlices(job, replicas[pytorchv1.PyTorchReplicaTypeWorker].Replicas, string(pytorchv1.PyTorchReplicaTypeWorker))
+	if err != nil {
+		return false, err
+	}
+	for index, podSlice := range podSlices {
+		if len(podSlice) == 1 {
+			pod := podSlice[0]
+			exitCode := util.GetContainerExitCode(pod, pytorchv1.DefaultContainerName)
+			if index == 0 && exitCode == 0 && pod.Status.Phase == corev1.PodSucceeded {
+				worker0Completed = true
+			}
+		}
+	}
+	return worker0Completed, nil
+}
+
+// getPodSlices returns a slice, which element is the slice of pod.
+// It gives enough information to caller to make decision to up/down scale resources.
+func (p *PyTorchJobReconciler) getPodSlices(job *pytorchv1.PyTorchJob, replicasNum *int32, rtype string) ([][]*corev1.Pod, error) {
+	logger := commonutil.LoggerForReplica(job, strings.ToLower(rtype))
+
+	pods, err := p.GetPodsForJob(job)
+	if err != nil {
+		commonutil.LoggerForJob(job).Warnf("getPodsForTFJob error %v", err)
+		return nil, err
+	}
+
+	// Get all pods for the type rt.
+	pods, err = p.JobController.FilterPodsForReplicaType(pods, strings.ToLower(rtype))
+	if err != nil {
+		return nil, err
+	}
+
+	podSlices := p.GetPodSlices(pods, int(*replicasNum), logger)
+	return podSlices, nil
 }
 
 // ContainsMasterSpec returns true if the tfjob contains master spec.
@@ -489,6 +557,9 @@ func (r *PyTorchJobReconciler) UpdateJobStatusInApiServer(job interface{}, jobSt
 
 // SetClusterSpec sets the cluster spec and init container for the pod
 func (r *PyTorchJobReconciler) SetClusterSpec(job interface{}, podTemplate *corev1.PodTemplateSpec, rtype, index string) error {
+	if err := setPodLabel(job, podTemplate, rtype, index); err != nil {
+		return err
+	}
 	if err := setPodEnv(job, podTemplate, rtype, index); err != nil {
 		return err
 	}
